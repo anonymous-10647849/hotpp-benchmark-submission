@@ -16,7 +16,9 @@ class ScaleGradient(torch.autograd.Function):
         return grad_output * ctx._weight, None
 
 
-def compute_delta(inputs, mask=None, delta="last", max_delta=None):
+def compute_delta(inputs, mask=None,
+                  delta="last", smoothing=None,
+                  max_delta=None, exclude_out_of_horizon=False):
     if delta == "last":
         deltas = inputs[:, 1:] - inputs[:, :-1]  # (B, L - 1).
         mask = torch.logical_and(mask[:, 1:], mask[:, :-1]) if mask is not None else None  # (B, L - 1).
@@ -26,6 +28,12 @@ def compute_delta(inputs, mask=None, delta="last", max_delta=None):
     else:
         raise ValueError(f"Unknown delta type: {delta}.")
     deltas = deltas.clip(min=0, max=max_delta)
+    if smoothing is not None:
+        deltas = deltas.float()
+        deltas = deltas + (torch.rand_like(deltas) - 0.5) * smoothing  # (-S / 2; S / 2).
+        deltas = deltas.abs()  # Make positive, but don't generate a large amount of zeros, like in clipping.
+    if (max_delta is not None) and exclude_out_of_horizon:
+        mask[deltas >= max_delta] = False
     return deltas, mask
 
 
@@ -105,7 +113,7 @@ class BaseLoss(ABC, torch.nn.Module):
         """Get most probable outputs.
 
         Args:
-            predictions: Mode outputs with shape (B, L, P).
+            predictions: Model outputs with shape (B, L, P).
 
         Returns:
             Modes with shape (B, L, D).
@@ -117,10 +125,22 @@ class BaseLoss(ABC, torch.nn.Module):
         """Get expected outputs.
 
         Args:
-            predictions: Mode outputs with shape (B, L, P).
+            predictions: Model outputs with shape (B, L, P).
 
         Returns:
             Means with shape (B, L, D).
+        """
+        pass
+
+    @abstractmethod
+    def predict_samples(self, predictions, temperature=1):
+        """Sample outputs.
+
+        Args:
+            predictions: Model outputs with shape (B, L, P).
+
+        Returns:
+            Samples with shape (B, L, D).
         """
         pass
 
@@ -130,12 +150,14 @@ class TimeMAELoss(BaseLoss):
 
     Args:
         delta: The type of time delta computation (`last` or `start`).
+        smoothing: The amount of noise to add to time deltas. Useful for discrete time to prevent spiky intensity.
     """
-    def __init__(self, delta="last", max_delta=None, grad_scale=None):
+    def __init__(self, delta="last", max_delta=None, smoothing=None, grad_scale=None):
         super().__init__(input_size=1, target_size=1,
                          grad_scale=grad_scale)
         self.delta = delta
         self.max_delta = max_delta
+        self.smoothing = smoothing
 
     def compute_loss(self, inputs, predictions, mask=None):
         """Compute losses and metrics.
@@ -152,7 +174,8 @@ class TimeMAELoss(BaseLoss):
         """
         assert predictions.shape[2] == 1
         predictions = predictions[:, :-1].squeeze(2)  # (B, L - 1).
-        deltas, mask = compute_delta(inputs, mask, delta=self.delta, max_delta=self.max_delta)
+        deltas, mask = compute_delta(inputs, mask, delta=self.delta,
+                                     max_delta=self.max_delta, smoothing=self.smoothing)
         losses = (predictions - deltas).abs()  # (B, L - 1).
         return losses, mask, {}
 
@@ -164,13 +187,18 @@ class TimeMAELoss(BaseLoss):
         # Delta is always positive.
         return predictions.clip(min=0)  # (B, L, 1).
 
+    def predict_samples(self, predictions, temperature=1):
+        # Delta is always positive.
+        return predictions.clip(min=0)  # (B, L, 1).
+
 
 class CrossEntropyLoss(BaseLoss):
     target_size = 1
 
-    def __init__(self, num_classes, grad_scale=None):
+    def __init__(self, num_classes, grad_scale=None, normalize_logits=True):
         super().__init__(input_size=num_classes, target_size=1,
                          grad_scale=grad_scale)
+        self.normalize_logits = normalize_logits
 
     @property
     def num_classes(self):
@@ -201,7 +229,10 @@ class CrossEntropyLoss(BaseLoss):
         return losses, mask, {}
 
     def predict_logits(self, predictions):
-        return predictions  # (B, L, C).
+        logits = predictions
+        if self.normalize_logits:
+            logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+        return logits  # (B, L, C).
 
     def predict_modes(self, predictions):
         return predictions.argmax(-1).unsqueeze(-1)  # (B, L, 1).
@@ -209,3 +240,7 @@ class CrossEntropyLoss(BaseLoss):
     def predict_means(self, predictions):
         # There is no mean for a categorical distribution. Return modes.
         return self.predict_modes(predictions)
+
+    def predict_samples(self, predictions, temperature=1):
+        probs = torch.nn.functional.softmax(predictions / temperature, dim=-1)  # (B, L, C).
+        return torch.distributions.categorical.Categorical(probs).sample().unsqueeze(-1)  # (B, L, 1).

@@ -9,13 +9,15 @@ class NextItemLoss(torch.nn.Module):
 
     Args:
         losses: Mapping from the feature name to the loss function.
-        prediction: The type of prediction (either `mean` or `mode`).
+        prediction: The type of prediction (either `mean`, `mode`, `sample`, or dictionary for each field).
+        temperature: Temperature for the `sample` mode.
     """
-    def __init__(self, losses, prediction="mean"):
+    def __init__(self, losses, prediction="mean", temperature=1):
         super().__init__()
         self._losses = torch.nn.ModuleDict(losses)
         self._order = list(sorted(losses))
         self._prediction = prediction
+        self._temperature = temperature
         self._interpolator = None
 
     @property
@@ -92,12 +94,15 @@ class NextItemLoss(torch.nn.Module):
         outputs = self._split_outputs(outputs)
         result = {}
         for name in (fields or self._losses):
-            if self._prediction == "mode":
-                result[name] = self._losses[name].predict_modes(outputs[name]).squeeze(-1)  # (B, L).
-            elif self._prediction == "mean":
+            prediction = self._prediction if isinstance(self._prediction, str) else self._prediction[name]
+            if prediction == "mean":
                 result[name] = self._losses[name].predict_means(outputs[name]).squeeze(-1)  # (B, L).
+            elif prediction == "mode":
+                result[name] = self._losses[name].predict_modes(outputs[name]).squeeze(-1)  # (B, L).
+            elif prediction == "sample":
+                result[name] = self._losses[name].predict_samples(outputs[name], temperature=self._temperature).squeeze(-1)  # (B, L).
             else:
-                raise ValueError(f"Unknown prediction type: {self._prediction}.")
+                raise ValueError(f"Unknown prediction type: {prediction}.")
         for name, target_name in (logits_fields_mapping or {}).items():
             result[target_name] = self._losses[name].predict_logits(outputs[name])  # (B, L, C).
         return PaddedBatch(result, seq_lens)

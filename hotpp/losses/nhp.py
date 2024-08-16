@@ -2,8 +2,9 @@ from functools import partial
 import torch
 
 from hotpp.data import PaddedBatch
+from hotpp.utils.torch import module_mode, BATCHNORM_TYPES
 from .common import compute_delta
-from .tpp import thinning_expectation
+from .tpp import thinning, thinning_expectation, thinning_sample
 
 
 class NHPLoss(torch.nn.Module):
@@ -18,24 +19,29 @@ class NHPLoss(torch.nn.Module):
         num_classes: The number of possible event types.
         timestamps_field: The name of the timestamps field.
         labels_field: The name of the labels field.
-        max_delta: Clip time delta maximum value.
+        time_smoothing: The amount of noise to add to time deltas. Useful for discrete time to prevent spiky intensity.
         max_intensity: Intensity threshold for preventing explosion.
         likelihood_sample_size: The sample size per event to compute integral.
-        expectation_steps: The maximum sample size used for means prediction.
+        thinning_params: A dictionary with thinning parameters.
+        prediction: The type of prediction (either `mean`, `sample`, or dictionary for each field).
     """
     def __init__(self, num_classes,
                  timestamps_field="timestamps",
                  labels_field="labels",
-                 max_delta=None, max_intensity=None,
-                 likelihood_sample_size=1, expectation_steps=None):
+                 time_smoothing=None,
+                 max_intensity=None,
+                 likelihood_sample_size=1,
+                 thinning_params=None,
+                 prediction="mean"):
         super().__init__()
         self._num_classes = num_classes
         self._timestamps_field = timestamps_field
         self._labels_field = labels_field
-        self._max_delta = max_delta
+        self._time_smoothing = time_smoothing
         self._max_intensity = max_intensity
         self._likelihood_sample_size = likelihood_sample_size
-        self._expectation_steps = expectation_steps
+        self._thinning_params = thinning_params or {}
+        self._prediction = prediction
         self._interpolator = None
         self.beta = torch.nn.Parameter(torch.ones(num_classes))
 
@@ -64,7 +70,8 @@ class NHPLoss(torch.nn.Module):
             beta = self.beta
         intensities = torch.nn.functional.softplus(outputs * beta) / beta / self._num_classes
         if self._max_intensity is not None:
-            intensities = intensities.clip(max=self._max_intensity)
+            scale = (self._max_intensity / intensities.sum(-1, keepdim=True).clip(min=1e-6)).clip(max=1)
+            intensities = intensities * scale
         return intensities
 
     def _forward_impl(self, inputs, outputs, states):
@@ -78,7 +85,7 @@ class NHPLoss(torch.nn.Module):
         # Extract targets.
         timestamps, mask = inputs.payload[self._timestamps_field], inputs.seq_len_mask  # (B, L), (B, L).
         lengths = (lengths - 1).clip(min=0)
-        deltas, mask = compute_delta(timestamps, mask, max_delta=self._max_delta)
+        deltas, mask = compute_delta(timestamps, mask, smoothing=self._time_smoothing)
         labels = inputs.payload[self._labels_field][:, 1:].long().clip(min=0, max=self._num_classes - 1)  # (B, L).
         states = states[:, :, :l - 1]
         # states: (N, B, L, D).
@@ -91,7 +98,7 @@ class NHPLoss(torch.nn.Module):
 
         sample_deltas = torch.rand(deltas.shape[0], deltas.shape[1], self._likelihood_sample_size,
                                    dtype=states.dtype, device=states.device)  # (B, L, S).
-        sample_deltas = deltas.unsqueeze(2) * sample_deltas  # (B, L, S).
+        sample_deltas *= deltas.unsqueeze(2)  # (B, L, S).
         sample_outputs = self._interpolator(states, PaddedBatch(sample_deltas, lengths)).payload  # (B, L, S, D).
         sample_intensities = self.intensity(sample_outputs)  # (B, L, S, D).
         integrals = sample_intensities.sum(3).mean(2) * deltas  # (B, L).
@@ -116,17 +123,15 @@ class NHPLoss(torch.nn.Module):
         """
         # Don't hurt BatchNorm statistics during sampling.
         # We expect, that head statistics are updated during outputs computation in the base module.
-        self._interpolator.eval()
-        losses, metrics = self._forward_impl(inputs, outputs, states)
-        if self.training:
-            self._interpolator.train()
+        with module_mode(self._interpolator, training=False, layer_types=BATCHNORM_TYPES):
+            losses, metrics = self._forward_impl(inputs, outputs, states)
         return losses, metrics
 
     def predict_next(self, outputs, states, fields=None, logits_fields_mapping=None):
         """Predict next events.
 
         Args:
-            outputs: Model outputs with shape (B, L, D).
+            outputs: Model outputs with shape (B, L, D). It is used only for sequence lengths extraction.
             states: Hidden model states with shape (N, B, L, D), where N is the number of layers.
             fields: The fields to predict next values for. By default, predict all fields.
             logits_fields_mapping: A mapping from field to the output logits field to predict logits for.
@@ -136,30 +141,68 @@ class NHPLoss(torch.nn.Module):
         """
         if (set(fields or []) | set(logits_fields_mapping or {})) - {self._timestamps_field, self._labels_field}:
             raise ValueError("Unexepcted field names")
-        b, l = outputs.shape
         seq_lens = outputs.seq_lens
+        _, b, l, _ = states.shape
 
         def intensity_fn(deltas):
-            result = self._interpolator(states, PaddedBatch(deltas, outputs.seq_lens)).payload  # (B, L, S, D).
+            result = self._interpolator(states, PaddedBatch(deltas, seq_lens)).payload  # (B, L, S, D).
             assert result.ndim == 4
             intensities = self.intensity(result)  # (B, L, S, D).
             return intensities.sum(3)  # (B, L, S).
 
-        timestamps = thinning_expectation(b, l,
-                                          intensity_fn=intensity_fn,
-                                          max_steps=self._expectation_steps,
-                                          max_delta=self._max_delta,
-                                          dtype=states.dtype, device=states.device)  # (B, L).
+        prediction = self._prediction if isinstance(self._prediction, str) else self._prediction[self._timestamps_field]
+        if prediction == "mean":
+            timestamps, _ = thinning_expectation(b, l,
+                                                 intensity_fn=intensity_fn,
+                                                 dtype=states.dtype, device=states.device,
+                                                 **self._thinning_params)  # (B, L), (B, L).
+        elif prediction == "sample":
+            timestamps, _ = thinning_sample(b, l,
+                                            intensity_fn=intensity_fn,
+                                            dtype=states.dtype, device=states.device,
+                                            **self._thinning_params)  # (B, L), (B, L).
+        else:
+            raise ValueError(f"Unknown prediction type: {prediction}.")
 
-        outputs = self.interpolator(states, PaddedBatch(timestamps.unsqueeze(2), seq_lens)).payload.squeeze(2)  # (B, L, D).
-        intensities = self.intensity(outputs)  # (B, L, D).
+        hiddens = self.interpolator(states, PaddedBatch(timestamps.unsqueeze(2), seq_lens)).payload.squeeze(2)  # (B, L, D).
+        intensities = self.intensity(hiddens)  # (B, L, D).
+        prediction = self._prediction if isinstance(self._prediction, str) else self._prediction[self._labels_field]
+        if prediction == "mean":
+            labels = intensities.argmax(2)  # (B, L).
+        elif prediction == "sample":
+            probs = intensities + torch.rand_like(intensities) * 1e-6  # (B, L, D).
+            probs = probs / probs.sum(-1, keepdim=True).clip(min=1e-6)  # (B, L, D).
+            labels = torch.distributions.Categorical(probs).sample()  # (B, L).
+        else:
+            raise ValueError(f"Unknown prediction type: {prediction}.")
 
         result = {}
         if (fields is None) or (self._timestamps_field in fields):
             result[self._timestamps_field] = timestamps
         if (fields is None) or (self._labels_field in fields):
-            result[self._labels_field] = intensities.argmax(2)
+            result[self._labels_field] = labels
         if self._labels_field in (logits_fields_mapping or {}):
             label_probs = intensities / intensities.sum(2, keepdim=True)  # (B, L, D).
             result[logits_fields_mapping[self._labels_field]] = label_probs.clip(min=1e-6).log()
+
         return PaddedBatch(result, seq_lens)
+
+    def compute_metrics(self, inputs, outputs, states):
+        seq_lens = outputs.seq_lens
+        _, b, l, _ = states.shape
+
+        def intensity_fn(deltas):
+            result = self._interpolator(states, PaddedBatch(deltas, seq_lens)).payload  # (B, L, S, D).
+            assert result.ndim == 4
+            intensities = self.intensity(result)  # (B, L, S, D).
+            return intensities.sum(3)  # (B, L, S).
+
+        _, accepted = thinning(b, l,
+                               intensity_fn=intensity_fn,
+                               dtype=states.dtype, device=states.device,
+                               **self._thinning_params)  # (B, L, N).
+
+        accepted = accepted.sum(2)  # (B, L).
+        return {
+            "thinning_accepted": accepted[outputs.seq_len_mask].float().mean().item()
+        }

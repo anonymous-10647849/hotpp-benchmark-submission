@@ -19,6 +19,10 @@ class Interpolator:
         self._encoder.train()
         self._head.train()
 
+    def modules(self):
+        yield self._encoder
+        yield self._head
+
     def __call__(self, states, time_deltas):
         outputs = self._encoder.interpolate(states, time_deltas)  # (B, L, S, D).
         return self._head(outputs)
@@ -131,7 +135,7 @@ class BaseModule(pl.LightningModule):
         losses, metrics = self._loss(x, outputs, states)
         return losses, metrics
 
-    def training_step(self, batch, _):
+    def training_step(self, batch, batch_idx):
         x, _ = batch
         hiddens, states = self.encode(x)
         outputs = self.apply_head(hiddens)  # (B, L, D).
@@ -145,9 +149,13 @@ class BaseModule(pl.LightningModule):
             self.log(f"train/{k}", v)
         self.log("train/loss", loss, prog_bar=True)
         self.log("sequence_length", x.seq_lens.float().mean(), prog_bar=True)
+        if batch_idx == 0:
+            with torch.no_grad():
+                for k, v in self._compute_single_batch_metrics(x, outputs, states).items():
+                    self.log(f"train/{k}", v, batch_size=len(x))
         return loss
 
-    def validation_step(self, batch, _):
+    def validation_step(self, batch, batch_idx):
         x, _ = batch
         hiddens, states = self.encode(x)
         outputs = self.apply_head(hiddens)  # (B, L, D).
@@ -162,8 +170,11 @@ class BaseModule(pl.LightningModule):
         self.log("val/loss", loss, batch_size=len(x), prog_bar=True)
         if self._val_metric is not None:
             self._update_metric(self._val_metric, x, outputs, states)
+        if batch_idx == 0:
+            for k, v in self._compute_single_batch_metrics(x, outputs, states).items():
+                self.log(f"val/{k}", v, batch_size=len(x))
 
-    def test_step(self, batch, _):
+    def test_step(self, batch, batch_idx):
         x, _ = batch
         hiddens, states = self.encode(x)
         outputs = self.apply_head(hiddens)  # (B, L, D).
@@ -178,6 +189,9 @@ class BaseModule(pl.LightningModule):
         self.log("test/loss", loss, batch_size=len(x), prog_bar=True)
         if self._test_metric is not None:
             self._update_metric(self._test_metric, x, outputs, states)
+        if batch_idx == 0:
+            for k, v in self._compute_single_batch_metrics(x, outputs, states).items():
+                self.log(f"test/{k}", v, batch_size=len(x))
 
     def on_validation_epoch_end(self):
         if self._val_metric is not None:
@@ -195,14 +209,16 @@ class BaseModule(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = self._optimizer_partial(self.parameters())
-        scheduler = self._lr_scheduler_partial(optimizer)
-
-        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler = {
-                "scheduler": scheduler,
-                "monitor": "val/loss",
-            }
-        return [optimizer], [scheduler]
+        if self._lr_scheduler_partial is None:
+            return optimizer
+        else:
+            scheduler = self._lr_scheduler_partial(optimizer)
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler = {
+                    "scheduler": scheduler,
+                    "monitor": "val/loss",
+                }
+            return [optimizer], [scheduler]
 
     def on_before_optimizer_step(self, optimizer=None, optimizer_idx=None):
         self.log("grad_norm", self._get_grad_norm(), prog_bar=True)
@@ -231,6 +247,13 @@ class BaseModule(pl.LightningModule):
                                   indices.seq_lens,
                                   sequences.payload[self._timestamps_field],
                                   sequences.payload[self._labels_logits_field])
+
+    def _compute_single_batch_metrics(self, inputs, outputs, states):
+        """Slow debug metrics."""
+        metrics = {}
+        if hasattr(self._loss, "compute_metrics"):
+            metrics.update(self._loss.compute_metrics(inputs, outputs, states))
+        return metrics
 
     @torch.no_grad()
     def _get_grad_norm(self):

@@ -3,7 +3,16 @@ num_evaluation_seeds: 5
 
 max_predictions: 16
 num_classes: 35  # Zero is excluded by PTLS.
-max_time_delta: 32  # Larger than horizon, but not too large.
+max_time_delta: 32
+max_duration: 32
+time_smoothing: null  # Time is continuous.
+max_intensity: null
+ode_lipschitz: 1
+rnn_hidden_size: 64
+thinning_params:
+  max_steps: 100
+  max_delta: ${max_time_delta}
+  bound_samples: 64
 
 logger:
   _target_: pytorch_lightning.loggers.WandbLogger
@@ -12,7 +21,7 @@ logger:
   save_dir: lightning_logs
 model_path: checkpoints/${name}.ckpt
 report: results/${name}.yaml
-multiseed_report: results/multiseed_${name}.txt
+multiseed_report: results/multiseed_${name}.yaml
 
 data_module:
   _target_: hotpp.data.HotppDataModule
@@ -28,8 +37,7 @@ metric:
   _target_: hotpp.metrics.HorizonMetric
   horizon: 28  # 4 weeks.
   horizon_evaluation_step: 4
-  max_time_delta: ${max_time_delta}
-  map_thresholds: [4]  # Days
+  map_deltas: [4]  # Days
   map_target_length: 16
   otd_steps: 5  # Half the minimum length.
   otd_insert_cost: 2
@@ -42,15 +50,14 @@ module:
       labels:
         in: ${num_classes}
         out: 16
-    hidden_size: 64
     max_time_delta: ${max_time_delta}
     max_inference_context: 64
     inference_context_step: 32
   head_partial:
     _target_: hotpp.nn.Head
     _partial_: true
-    use_batch_norm: true
     hidden_dims: [64]
+    use_batch_norm: true
   optimizer_partial:
     _partial_: true
     _target_: torch.optim.Adam
@@ -74,5 +81,5 @@ trainer:
   gradient_clip_val: 1  # Increases training stability.
   check_val_every_n_epoch: 3
   model_selection:
-    metric: val/detection-mAP
+    metric: val/T-mAP
     mode: max
